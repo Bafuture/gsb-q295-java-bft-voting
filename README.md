@@ -30,3 +30,52 @@ Pair-wise GSB 标注任务仓库（第 18 批 / 295）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+## 实现说明（PBFT 简化版）
+
+代码位于 `src/main/java/com/example/gsb/pbft/`，测试位于 `src/test/java/com/example/gsb/pbft/`。
+
+### 三阶段协议
+
+1. **预准备（PRE-PREPARE）**：客户端请求经 `Cluster.submitRequest` 提交后，当前视图主节点（`p = v mod n`）分配序号并广播预准备消息，副本校验签名与主节点身份后广播准备消息。
+2. **准备（PREPARE）**：副本集齐 **2f 个来自不同节点**且摘要与预准备一致的准备消息后进入提交阶段。准备消息按发送者去重，重复消息计入 `dedupDrops`；同一发送者对同一序号发出不同摘要计为矛盾消息（`conflictDrops`）。
+3. **提交（COMMIT）**：副本集齐 **2f+1** 个提交消息后执行请求，每个请求摘要只执行一次；当不少于 2f+1 个节点执行同一请求时，集群判定该请求“达成一致”（`finalizedRequests`）。
+
+### 为什么需要 3f+1 个节点
+
+- **安全性（仲裁交集）**：任意两个法定人数（quorum）为 2f+1 的集合，在 n 个节点中至少相交 `2(2f+1) − n` 个节点。要保证交集中至少有一个诚实节点（即交集大小 ≥ f+1），需 `2(2f+1) − n ≥ f+1`，解得 **n ≥ 3f+1**。
+- **活性**：f 个节点可能完全沉默，剩余 n−f 个节点必须能凑齐 2f+1 的提交法定人数，即 `n − f ≥ 2f+1`，同样得到 **n ≥ 3f+1**。
+
+### 视图更换
+
+- 主节点失效（崩溃或沉默）时，各节点超时进入 `view+1` 并广播 `VIEW_CHANGE`，消息携带本节点已知的未完成请求（`seq:digest:request` 列表）。
+- 新主节点（`p = v mod n`）收集 **2f+1** 个 `VIEW_CHANGE` 后广播 `NEW_VIEW`，其中携带：本地轮次与视图更换消息中汇总的未完成请求的新预准备（沿用原序号），以及排队中的新请求（分配新序号）。
+- 副本校验 `NEW_VIEW` 后在新视图重走三阶段，未完成请求继续达成一致；旧视图迟到的消息按过期消息丢弃（`staleDrops`）。
+
+### 恶意行为模拟（`ByzantineNode`）
+
+- **伪造消息（FORGER）**：发出签名被篡改的消息，被签名校验丢弃（`invalidSignatureDrops`）。
+- **延迟响应（DELAYER）**：扣押全部出站消息，可稍后补发；3 个诚实节点即可满足法定人数，迟到的消息被安全吸收。
+- **矛盾消息（EQUIVOCATOR）**：对同一序号额外广播摘要不同的准备消息，因与预准备摘要不一致被丢弃，无法分裂诚实多数。
+
+### 签名校验
+
+用 HmacSHA256 模拟签名：每个节点持有预共享密钥，所有节点可校验任意发送者的消息认证码。签名不匹配、身份伪造（用攻击者密钥签他人身份）的消息一律丢弃。
+
+### 统计（`Stats`）
+
+各阶段消息发送数（`prePrepareSent`/`prepareSent`/`commitSent`/`viewChangeSent`/`newViewSent`）、去重丢弃数（`dedupDrops`）、签名失败丢弃数（`invalidSignatureDrops`）、矛盾丢弃数（`conflictDrops`）、过期丢弃数（`staleDrops`）、完成的视图更换次数（`viewChanges`）、达成一致的请求数（`finalizedRequests`）。
+
+### 节点数不足 3f+1 的后果
+
+以 n=3、f=1 为例（要求 n ≥ 4）：提交法定人数为 2f+1=3，一个节点沉默后只剩 2 个诚实节点，**永远无法凑齐提交法定人数，系统卡死（失去活性）**；同时两个 2f+1 的仲裁交集可能不含诚实节点，**两个冲突请求可能被分别提交（失去安全性）**。`InsufficientNodesTest` 用测试证明：n=3、f=1 时请求无法达成一致，而 n=4、f=1 可以。
+
+### 测试与运行
+
+```bash
+mvn -q verify   # 或 ./mvnw -q verify
+```
+
+测试覆盖：三阶段达成与统计（`PbftConsensusTest`）、重复消息去重（同）、三类恶意行为（`ByzantineBehaviorTest`）、视图更换与未完成请求续传（`ViewChangeTest`）、签名校验与身份伪造（`SignatureTest`）、节点数不足（`InsufficientNodesTest`）。
